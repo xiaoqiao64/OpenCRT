@@ -207,6 +207,18 @@ host; map it with `F1 = menu: shortcuts` to open that list instead.
 `Alt+R = menu: focus-connect-bar` puts the keyboard in the toolbar's quick
 connect box, as Alt+R does in SecureCRT (Alt+R stays with the host unless mapped).
 
+### Linux input methods (IME)
+The terminal accepts system input methods, including Sogou under Fcitx 4 and
+Fcitx 5. On X11 and XWayland, keep `XMODIFIERS=@im=fcitx` in the environment
+that starts OpenCRT. On a Wayland session running Fcitx 4, OpenCRT starts
+through X11/XWayland because Fcitx 4 has no native Wayland text-input
+frontend. Fcitx 5 keeps the native Wayland `text-input-v3` path. OpenCRT does
+not change `XMODIFIERS`, `GTK_IM_MODULE`, `QT_IM_MODULE` or `SDL_IM_MODULE`.
+
+Composition is shown above the terminal cursor and committed text is encoded
+for the session. Candidate-window placement on Wayland depends on the
+compositor and its input-method protocol.
+
 ## Command-line tools
 `ocrt` (installed beside OpenCRT) uses OpenCRT's known host keys and SSH code:
 

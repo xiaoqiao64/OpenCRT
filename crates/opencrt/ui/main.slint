@@ -4361,6 +4361,14 @@ export component MainWindow inherits Window {
     callback files-action(int, int, string);
     callback files-filter(int, int, string);
     in property <color> terminal-bg: black;
+    // IME pre-edit text and its place in the terminal area. Pre-edit is shown
+    // locally; only committed text is sent to a session.
+    in property <string> ime-preedit: "";
+    in property <length> ime-x: 0px;
+    in property <length> ime-y: 0px;
+    in property <length> ime-width: 0px;
+    in property <length> ime-height: 0px;
+    in property <length> ime-font-size: 15px;
     in property <image> dock-label-sessions;
     in property <image> dock-label-active;
     in property <image> dock-label-commands;
@@ -4718,7 +4726,11 @@ export component MainWindow inherits Window {
     // --- state read by Rust ---
     out property <length> term-width: term-area.width;
     out property <length> term-height: term-area.height;
+    out property <length> term-origin-x: term-area.absolute-position.x;
+    out property <length> term-origin-y: term-area.absolute-position.y;
     out property <bool> term-focused: fs.has-focus;
+    // Slint's own TextInputs manage IME themselves; the terminal does not.
+    out property <bool> ui-text-focused: TextInputInterface.text-input-focused;
 
     // --- events to Rust ---
     callback terminal-key(string, bool, bool, bool, bool) -> bool;
@@ -5758,6 +5770,27 @@ export component MainWindow inherits Window {
                 Rectangle {
                     background: #ffffff38;
                     visible: root.bell;
+                }
+                // Composition stays local until the input method commits it.
+                Rectangle {
+                    visible: root.ime-preedit != "";
+                    x: root.ime-x;
+                    y: root.ime-y;
+                    width: root.ime-width;
+                    height: root.ime-height;
+                    background: Theme.input-bg;
+                    border-width: 1px;
+                    border-color: Theme.accent;
+                    Text {
+                        x: 2px;
+                        width: parent.width - 4px;
+                        height: parent.height;
+                        text: root.ime-preedit;
+                        color: Theme.text;
+                        font-size: root.ime-font-size;
+                        vertical-alignment: center;
+                        overflow: clip;
+                    }
                 }
             }
             }

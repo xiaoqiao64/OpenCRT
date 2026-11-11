@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
-use slint::winit_030::winit::event::{ElementState, KeyEvent};
+use slint::winit_030::winit::dpi::{LogicalPosition, LogicalSize as WinitLogicalSize};
+use slint::winit_030::winit::event::{ElementState, Ime, KeyEvent, WindowEvent};
 use slint::winit_030::winit::keyboard::{KeyCode, PhysicalKey};
+use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode, VecModel};
 
 use crate::config::{self, Credential, FlowControl, Options, Parity, Protocol, SerialLine, Session, SessionStore};
 use crate::forward::{Forward, ForwardKind};
+use crate::ime;
 use crate::rdp::ToHelper;
 use crate::{kermit, local, python, rdp, rhaiscript, script, serial, sftp, telnet, tftp, update, vnc, xymodem, zmodem};
 use crate::input::{self, KeyAction, Mods};
@@ -1622,6 +1625,8 @@ struct App {
     /// Terminal area in physical pixels.
     pixels: (usize, usize),
     focused: bool,
+    /// Input-method composition, permission and candidate-window geometry.
+    ime: ime::State,
     mouse: Mouse,
     /// Tab whose host-key or login prompt is on screen.
     dialog_tab: Option<usize>,
@@ -1914,6 +1919,7 @@ impl App {
             scale: 0.0,
             pixels: (0, 0),
             focused: false,
+            ime: ime::State::default(),
             mouse: Mouse::default(),
             dialog_tab: None,
             script_dialog: None,
@@ -2998,6 +3004,90 @@ impl App {
         sent
     }
 
+    /// True when an input-method event belongs to the terminal, not a Slint
+    /// TextInput or a remote desktop that needs physical keys.
+    fn ime_owns_event(&self, ui: &MainWindow) -> bool {
+        let remote = self.tabs.get(self.active).is_some_and(|tab| tab.screen.is_some());
+        ui.get_dialog() == DIALOG_NONE
+            && ui.get_term_focused()
+            && !ui.get_ui_text_focused()
+            && !remote
+            && self.ime.window_active()
+    }
+
+    /// Committed composition is plain UTF-8; each session's codec converts it.
+    fn on_ime_commit(&mut self, text: &str, ui: &MainWindow) {
+        self.ime.clear_preedit();
+        if text.is_empty() || !self.ime_owns_event(ui) {
+            return;
+        }
+        let stopped = self.tabs.get_mut(self.active).and_then(|tab| tab.pacer.take()).is_some();
+        if stopped {
+            self.notify("Stopped sending the pasted text.");
+        }
+        self.send_input(text.as_bytes().to_vec());
+    }
+
+    /// Cursor-cell rectangle in terminal-area coordinates. `columns` widens it
+    /// to fit the composition text drawn over the terminal.
+    fn ime_geometry(&self, columns: f32) -> ime::Rect {
+        let empty = ime::Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        let (Some(pane), Some(tab)) = (self.panes.iter().find(|p| p.tab == self.active).copied(), self.tabs.get(self.active)) else {
+            return empty;
+        };
+        ime::composition_rect(
+            pane.image,
+            self.logical_cell(),
+            (pane.zoom[0], pane.zoom[1]),
+            tab.terminal.size(),
+            tab.terminal.cursor_position(),
+            columns,
+        )
+    }
+
+    fn sync_ime_overlay(&mut self, ui: &MainWindow) {
+        let rect = self.ime_geometry(ime::text_columns(self.ime.preedit()));
+        if let Some((text, rect)) = self.ime.sync_overlay(rect) {
+            ui.set_ime_preedit(text.into());
+            ui.set_ime_x(rect.x);
+            ui.set_ime_y(rect.y);
+            ui.set_ime_width(rect.width);
+            ui.set_ime_height(rect.height);
+        }
+        if (ui.get_ime_font_size() - self.options.font_size).abs() > 0.01 {
+            ui.set_ime_font_size(self.options.font_size);
+        }
+    }
+
+    /// Enable the terminal's IME only while it owns the keyboard, and tell
+    /// winit where the cursor is so Fcitx can place its candidate window.
+    fn sync_ime(&mut self, ui: &MainWindow) {
+        let remote = self.tabs.get(self.active).is_some_and(|tab| tab.screen.is_some());
+        let decision = ime::decision(
+            ui.get_term_focused(),
+            ui.get_dialog() != DIALOG_NONE,
+            ui.get_ui_text_focused(),
+            remote,
+            self.ime.window_active(),
+        );
+        if let Some(allowed) = self.ime.sync_allowed(decision) {
+            ui.window().with_winit_window(|window| window.set_ime_allowed(allowed));
+        }
+        if decision == ime::Decision::Allow(true) {
+            let origin = (ui.get_term_origin_x(), ui.get_term_origin_y());
+            let rect = self.ime_geometry(1.0).in_window(origin);
+            if self.ime.sync_cursor_area(rect) {
+                ui.window().with_winit_window(|window| {
+                    window.set_ime_cursor_area(
+                        LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)),
+                        WinitLogicalSize::new(f64::from(rect.width), f64::from(rect.height)),
+                    );
+                });
+            }
+        }
+        self.sync_ime_overlay(ui);
+    }
+
     /// RDP: the active tab's input to its helper, while it shows a desktop.
     fn rdp_input(&self) -> Option<(&rdp::Input, &rdp::Desktop)> {
         let tab = self.tabs.get(self.active)?;
@@ -3805,6 +3895,7 @@ impl App {
             None => {}
         }
         ui.set_bell(bell);
+        self.sync_ime(ui);
         if let Some((caps, num)) = lock_keys() {
             ui.set_show_locks(true);
             ui.set_caps_on(caps);
@@ -7994,10 +8085,10 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         });
     }
 
-    // Files dropped from the desktop (Slint does not pass these on itself), and
-    // RDP keyboard input, which needs the physical keys Slint does not report.
+    // Files dropped from the desktop (Slint does not pass these on itself),
+    // RDP keyboard input, which needs the physical keys Slint does not report,
+    // and terminal IME composition, which a FocusScope does not handle.
     {
-        use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
         let app = app.clone();
         let weak = ui.as_weak();
         ui.window().on_winit_window_event(move |_, event| {
@@ -8005,14 +8096,36 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
                 return EventResult::Propagate;
             };
             match event {
+                WindowEvent::Ime(Ime::Commit(text)) if app.ime_owns_event(&ui) => {
+                    app.on_ime_commit(text, &ui);
+                    app.sync_ime_overlay(&ui);
+                    return EventResult::PreventDefault;
+                }
+                WindowEvent::Ime(Ime::Preedit(text, _)) if app.ime_owns_event(&ui) => {
+                    app.ime.set_preedit(text.clone());
+                    app.sync_ime_overlay(&ui);
+                    return EventResult::PreventDefault;
+                }
+                // Slint's TextInputs keep their own IME state; never leave a
+                // terminal composition on screen behind their events.
+                WindowEvent::Ime(_) => {
+                    app.ime.clear_preedit();
+                    app.sync_ime_overlay(&ui);
+                }
                 WindowEvent::DroppedFile(path) => app.dropped_file(path, &ui),
                 WindowEvent::KeyboardInput { event, .. } if app.rdp_key(event, &ui) => {
                     return EventResult::PreventDefault;
                 }
                 WindowEvent::Occluded(false) => app.repaint_all = true,
-                WindowEvent::Focused(false) => app.rdp_release_all(),
+                WindowEvent::Focused(false) => {
+                    app.ime.set_window_focused(false);
+                    app.rdp_release_all();
+                }
                 // Back from another program: its copied text may be pasted remotely.
-                WindowEvent::Focused(true) => app.rdp_offer_clipboard(),
+                WindowEvent::Focused(true) => {
+                    app.ime.set_window_focused(true);
+                    app.rdp_offer_clipboard();
+                }
                 _ => {}
             }
             EventResult::Propagate
@@ -8117,7 +8230,6 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             while let Ok(args) = handed_over.try_recv() {
                 app.open_args(&args, &ui);
                 ui.window().set_minimized(false);
-                use slint::winit_030::WinitWindowAccessor;
                 ui.window().with_winit_window(|w| w.focus_window());
             }
             app.tick(&ui);

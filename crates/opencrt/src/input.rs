@@ -558,6 +558,7 @@ mod tests {
         assert_eq!(key("\t", SHIFT, false), b"\x1b[Z");
         assert_eq!(key(&s(BACKTAB), SHIFT, false), b"\x1b[Z");
         assert_eq!(key("é", NONE, false), "é".as_bytes());
+        assert_eq!(key("中文", NONE, false), "中文".as_bytes(), "an IME commit is sent whole");
         assert_eq!(key_bytes("\u{0011}", CTRL, false), None, "bare Control press");
     }
 
